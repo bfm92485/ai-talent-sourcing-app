@@ -1,0 +1,18 @@
+include MANIFEST.in
+include requirements.txt
+include *.json
+include *.md
+include *.py
+include *.txt
+recursive-include ai_talent_sourcing *.css
+recursive-include ai_talent_sourcing *.csv
+recursive-include ai_talent_sourcing *.html
+recursive-include ai_talent_sourcing *.ico
+recursive-include ai_talent_sourcing *.js
+recursive-include ai_talent_sourcing *.json
+recursive-include ai_talent_sourcing *.md
+recursive-include ai_talent_sourcing *.png
+recursive-include ai_talent_sourcing *.py
+recursive-include ai_talent_sourcing *.svg
+recursive-include ai_talent_sourcing *.txt
+recursive-exclude ai_talent_sourcing *.pyc

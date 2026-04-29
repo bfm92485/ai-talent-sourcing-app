@@ -1,0 +1,16 @@
+[project]
+name = "ai_talent_sourcing"
+version = "0.0.1"
+description = "AI-powered talent sourcing pipeline integration with ERPNext"
+authors = [
+    {name = "Bryan Murphy", email = "bryan.f.murphy@gmail.com"}
+]
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[tool.bench]
+app-name = "ai_talent_sourcing"

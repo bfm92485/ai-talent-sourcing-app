@@ -1,0 +1,2 @@
+# Frappe manages dependencies via hooks.py
+# Add any additional pip packages here
