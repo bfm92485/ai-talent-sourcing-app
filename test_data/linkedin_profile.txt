@@ -1,0 +1,35 @@
+Sarah Chen
+Senior Product Manager at Stripe
+San Francisco Bay Area
+
+About:
+Product leader with 10+ years driving growth at fintech and SaaS companies.
+Passionate about building products that simplify complex financial workflows.
+
+Experience:
+Senior Product Manager | Stripe | Aug 2021 - Present
+- Led payments optimization team, increasing conversion rates by 12%
+- Launched Stripe Tax product in 5 new markets
+- Managed cross-functional team of 15 engineers and designers
+
+Product Manager | Square | Jan 2018 - Jul 2021
+- Owned Square Invoices product line ($200M ARR)
+- Drove mobile-first redesign resulting in 30% engagement increase
+- Established product analytics framework using Amplitude
+
+Associate Product Manager | Intuit | Jun 2015 - Dec 2017
+- Contributed to QuickBooks Online small business features
+- Conducted 50+ customer interviews for discovery research
+
+Education:
+MBA | Stanford Graduate School of Business | 2013 - 2015
+B.A. Economics | UC Berkeley | 2009 - 2013
+
+Skills:
+Product Strategy, Payments, Fintech, Agile, Scrum, SQL, Python,
+A/B Testing, User Research, Data Analysis, Figma, JIRA, Amplitude,
+Cross-functional Leadership, Go-to-Market Strategy
+
+Contact:
+sarah.chen@email.com
+linkedin.com/in/sarahchen-pm
