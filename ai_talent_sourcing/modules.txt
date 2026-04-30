@@ -1,1 +1,3 @@
-AI Talent Sourcing
+Talent Candidate
+Candidate Enrichment
+Persona Config
