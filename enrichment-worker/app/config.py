@@ -1,4 +1,7 @@
-"""Configuration module — loads all settings from environment variables."""
+"""Configuration module — loads all settings from environment variables.
+
+Updated for Primitive managed SaaS (no VPS needed) and async processing.
+"""
 
 import os
 from dataclasses import dataclass, field
@@ -8,7 +11,7 @@ from dataclasses import dataclass, field
 class Settings:
     """Application settings loaded from environment variables."""
 
-    # Webhook security
+    # Webhook security (HMAC secret from Primitive dashboard)
     webhook_secret: str = field(
         default_factory=lambda: os.environ.get("WEBHOOK_SECRET", "dev-secret-change-me")
     )
@@ -25,11 +28,6 @@ class Settings:
     )
     erpnext_api_secret: str = field(
         default_factory=lambda: os.environ.get("ERPNEXT_API_SECRET", "")
-    )
-
-    # PrimitiveMail attachment download
-    primitivemail_base_url: str = field(
-        default_factory=lambda: os.environ.get("PRIMITIVEMAIL_BASE_URL", "http://localhost:3000")
     )
 
     # LLM (Gemini / OpenAI-compatible)
@@ -49,6 +47,11 @@ class Settings:
     )
     port: int = field(
         default_factory=lambda: int(os.environ.get("PORT", "8080"))
+    )
+
+    # Feature flags
+    disable_test_endpoint: bool = field(
+        default_factory=lambda: os.environ.get("DISABLE_TEST_ENDPOINT", "").lower() in ("1", "true", "yes")
     )
 
 

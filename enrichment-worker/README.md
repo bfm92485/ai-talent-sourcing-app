@@ -1,80 +1,86 @@
-# Enrichment Worker
+# Enrichment Worker v2.0
 
-FastAPI service that receives inbound email webhooks from PrimitiveMail, parses resume attachments using BAML AI extraction (Gemini Flash), and creates fully-enriched Job Applicant records in ERPNext v16.
+FastAPI service that processes inbound email webhooks and creates AI-enriched Job Applicant records in ERPNext.
 
 ## Architecture
 
 ```
-PrimitiveMail (SMTP) → Webhook POST → This Worker → ERPNext REST API
+Primitive (managed SaaS)  →  Webhook POST (HMAC-signed)  →  This Worker  →  ERPNext REST API
+     ↓                                                            ↓
+  tar.gz archive                                          BAML ExtractResume
+  (attachments)                                           (Gemini Flash)
 ```
+
+**Key design decisions:**
+- **Primitive** is a managed SaaS (primitive.dev) — no self-hosted VPS/Postfix needed
+- Webhook returns **200 immediately**, processes async in background (prevents retry storms)
+- **Idempotency** via event_id/Message-ID dedup (Primitive retries up to 6 times)
+- `reference_name` uses ERPNext's **auto-generated name** (e.g., `HR-APP-2026-00042`), NOT email
+- Attachments uploaded as **private files** (`is_private=1`) — resumes contain PII
+- PDF extraction uses **pdfplumber** (MIT license), not PyMuPDF (AGPL)
 
 ## Endpoints
 
-| Method | Path | Auth | Purpose |
-|--------|------|------|---------|
-| GET | `/health` | None | Health check |
-| POST | `/webhook/inbound-email` | HMAC-SHA256 | Production webhook receiver |
-| POST | `/webhook/test` | None | Development testing (no HMAC) |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/health` | None | Health check for Railway |
+| POST | `/webhook/inbound-email` | HMAC-SHA256 | Production webhook from Primitive |
+| POST | `/webhook/test` | None | Dev/test endpoint (disable in prod) |
 
 ## Environment Variables
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `WEBHOOK_SECRET` | Yes | `dev-secret-change-me` | Shared HMAC secret with PrimitiveMail |
-| `ERPNEXT_URL` | Yes | (Railway URL) | ERPNext base URL |
-| `ERPNEXT_API_KEY` | Yes | — | ERPNext API key |
-| `ERPNEXT_API_SECRET` | Yes | — | ERPNext API secret |
-| `PRIMITIVEMAIL_BASE_URL` | Yes | `http://localhost:3000` | PrimitiveMail attachment download base |
-| `GEMINI_API_KEY` | Yes | — | Google Gemini API key for BAML |
-| `MAX_ATTACHMENT_SIZE` | No | `25000000` | Max attachment size in bytes |
-| `DATA_TTL_DAYS` | No | `90` | Days until data expiry |
-| `PORT` | No | `8080` | Server port |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `WEBHOOK_SECRET` | Yes (prod) | HMAC secret from Primitive dashboard |
+| `ERPNEXT_URL` | Yes | ERPNext instance URL |
+| `ERPNEXT_API_KEY` | Yes | ERPNext API key |
+| `ERPNEXT_API_SECRET` | Yes | ERPNext API secret |
+| `GEMINI_API_KEY` | Yes | Google Gemini API key for BAML |
+| `OPENAI_API_KEY` | Fallback | OpenAI-compatible API key |
+| `MAX_ATTACHMENT_SIZE` | No | Max attachment size in bytes (default: 25MB) |
+| `DATA_TTL_DAYS` | No | Days until data expires (default: 90) |
+| `PORT` | No | Server port (default: 8080) |
+| `DISABLE_TEST_ENDPOINT` | No | Set to "true" in production |
 
 ## Local Development
 
 ```bash
-cd enrichment-worker
+# Install dependencies
 pip install -r requirements.txt
 
 # Generate BAML client
-cd .. && baml-cli generate && cd enrichment-worker
+cd baml_src && baml-cli generate && cd ..
 
 # Set environment variables
-export ERPNEXT_URL=https://erpnext-v16-talent-sourcing-production.up.railway.app
-export ERPNEXT_API_KEY=your_key
-export ERPNEXT_API_SECRET=your_secret
-export GEMINI_API_KEY=your_gemini_key
-export WEBHOOK_SECRET=your_shared_secret
+export ERPNEXT_URL="https://erpnext-v16-talent-sourcing-production.up.railway.app"
+export ERPNEXT_API_KEY="your-key"
+export ERPNEXT_API_SECRET="your-secret"
+export GEMINI_API_KEY="your-gemini-key"
 
-# Run
-uvicorn app.main:app --reload --port 8080
+# Run the server
+uvicorn app.main:app --host 0.0.0.0 --port 8090 --reload
 ```
 
 ## Testing
 
 ```bash
-# Health check
-curl http://localhost:8080/health
-
-# Test with resume text (no HMAC required)
-curl -X POST http://localhost:8080/webhook/test \
+# Test with a resume
+curl -X POST http://localhost:8090/webhook/test \
   -H "Content-Type: application/json" \
-  -d '{"resume_text": "John Doe\njohn@example.com\nSenior Engineer at Acme Corp\nSkills: Python, FastAPI, Docker"}'
-
-# Simulate PrimitiveMail webhook (with HMAC)
-PAYLOAD='{"from":"John Doe <john@example.com>","to":["apply@talent.amdg.cc"],"subject":"Application","body_text":"...","attachments":[]}'
-SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | cut -d' ' -f2)
-curl -X POST http://localhost:8080/webhook/inbound-email \
-  -H "Content-Type: application/json" \
-  -H "X-Webhook-Signature: $SIGNATURE" \
-  -d "$PAYLOAD"
+  -d '{"resume_text": "John Doe\njohn@example.com\nSenior Engineer at Acme Corp..."}'
 ```
 
 ## Deployment (Railway)
 
-This service is designed to run as a separate service in the same Railway project as ERPNext v16. Deploy via:
+The service deploys as a separate Railway service in the same project as ERPNext.
+See `railway.toml` and `Dockerfile` for configuration.
 
-```bash
-railway link -p erpnext-v16-talent-sourcing
-railway up --service enrichment-worker
-```
+## Bug Fixes (v2.0 — Council Review 2026-05-01)
+
+- **reference_name**: Now uses auto-generated `name` from create response, not email
+- **Idempotency**: Dedup on event_id/Message-ID prevents duplicate processing
+- **is_private**: All file uploads default to private (PII protection)
+- **PyMuPDF → pdfplumber**: MIT license, no AGPL source-disclosure obligations
+- **Async processing**: Returns 200 immediately, processes in background
+- **Primitive SaaS**: Corrected architecture — no VPS needed, attachments via tar.gz
+- **Dedup by email filter**: Uses `find_job_applicant_by_email()` not name lookup

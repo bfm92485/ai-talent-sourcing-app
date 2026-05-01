@@ -1,4 +1,13 @@
-"""Pydantic models for PrimitiveMail webhook payloads."""
+"""Pydantic models for Primitive (managed SaaS) webhook payloads.
+
+Primitive delivers emails as JSON webhook events with:
+- event_id: unique event identifier for idempotency
+- message_id: RFC 2822 Message-ID
+- attachments_download_url: URL to tar.gz archive of all attachments
+- attachments[]: metadata with tar_path for extraction from archive
+
+See: https://primitive.dev/docs (webhook delivery format)
+"""
 
 from datetime import datetime
 from typing import Optional
@@ -6,13 +15,13 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
-class Attachment(BaseModel):
-    """Email attachment metadata from PrimitiveMail."""
+class PrimitiveAttachment(BaseModel):
+    """Attachment metadata from Primitive webhook payload."""
 
     filename: str
-    content_type: str
-    size: int
-    path: str  # Relative path on PrimitiveMail storage
+    content_type: str = ""
+    size: int = 0
+    tar_path: str = ""  # Path within the tar.gz archive
 
 
 class AuthResults(BaseModel):
@@ -23,22 +32,36 @@ class AuthResults(BaseModel):
     dmarc: Optional[str] = None
 
 
-class InboundEmailPayload(BaseModel):
+class PrimitiveWebhookPayload(BaseModel):
     """
-    Webhook payload sent by PrimitiveMail watcher when a new email arrives.
+    Webhook payload sent by Primitive (managed SaaS) when a new email arrives.
 
-    This model represents the canonical JSON structure produced by the milter
-    and delivered via the watcher's HTTP POST.
+    Primitive is a managed email receiving service — no self-hosted VPS needed.
+    The webhook is HMAC-signed and retried up to 6 times on non-2xx responses.
     """
 
-    message_id: str = Field(..., description="RFC 2822 Message-ID")
-    from_address: str = Field(..., alias="from", description="Sender (Name <email>)")
+    # Idempotency / dedup
+    event_id: Optional[str] = Field(None, description="Unique event ID from Primitive")
+    message_id: str = Field("", description="RFC 2822 Message-ID")
+
+    # Sender/recipient
+    from_address: str = Field("", alias="from", description="Sender (Name <email>)")
     to: list[str] = Field(default_factory=list, description="Recipient addresses")
+    cc: list[str] = Field(default_factory=list, description="CC addresses")
+
+    # Content
     subject: Optional[str] = None
     body_text: Optional[str] = None
     body_html: Optional[str] = None
-    attachments: list[Attachment] = Field(default_factory=list)
-    received_at: Optional[datetime] = None
+
+    # Attachments
+    attachments: list[PrimitiveAttachment] = Field(default_factory=list)
+    attachments_download_url: Optional[str] = Field(
+        None, description="URL to download tar.gz archive of all attachments"
+    )
+
+    # Metadata
+    received_at: Optional[str] = None
     auth_results: Optional[AuthResults] = None
 
     class Config:
@@ -62,7 +85,7 @@ class InboundEmailPayload(BaseModel):
         return addr.strip()
 
     @property
-    def resume_attachments(self) -> list[Attachment]:
+    def resume_attachments(self) -> list[PrimitiveAttachment]:
         """Filter attachments to only resume-like files (PDF, DOCX)."""
         resume_types = {
             "application/pdf",

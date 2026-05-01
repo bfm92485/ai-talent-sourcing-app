@@ -1,8 +1,17 @@
-"""Security utilities — HMAC signature verification for webhook payloads."""
+"""Security utilities — HMAC signature verification for webhook payloads.
+
+Primitive (managed SaaS) signs webhook payloads with HMAC-SHA256 using the
+secret configured in the Primitive dashboard. The signature is sent in the
+X-Webhook-Signature header, optionally prefixed with 'sha256='.
+"""
 
 import hashlib
 import hmac
+import logging
+
 from fastapi import HTTPException, Request
+
+logger = logging.getLogger(__name__)
 
 
 def verify_hmac_signature(payload: bytes, signature: str, secret: str) -> bool:
@@ -43,6 +52,9 @@ async def get_verified_body(request: Request, secret: str) -> bytes:
     """
     Read request body and verify its HMAC signature.
 
+    In dev mode (secret = "dev-secret-change-me"), verification is skipped
+    to allow local testing without a real Primitive webhook secret.
+
     Args:
         request: FastAPI Request object.
         secret: Shared HMAC secret.
@@ -51,6 +63,12 @@ async def get_verified_body(request: Request, secret: str) -> bytes:
         Verified raw body bytes.
     """
     body = await request.body()
+
+    # Dev mode bypass
+    if secret == "dev-secret-change-me":
+        logger.warning("HMAC verification SKIPPED (dev mode — set WEBHOOK_SECRET for production)")
+        return body
+
     signature = request.headers.get("X-Webhook-Signature", "")
     verify_hmac_signature(body, signature, secret)
     return body

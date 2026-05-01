@@ -1,7 +1,15 @@
-"""ERPNext REST API client for Job Applicant CRUD and file upload."""
+"""ERPNext REST API client for Job Applicant CRUD and file upload.
+
+Bug fixes applied per council review (2026-05-01):
+- reference_name uses auto-generated name (e.g., HR-APP-2026-00042), NOT email
+- File uploads use is_private=1 to protect PII
+- Dedup checks by email filter (not by name lookup)
+- All downstream calls use the returned 'name' field
+"""
 
 import logging
 from typing import Any, Optional
+from urllib.parse import quote
 
 import requests
 
@@ -22,10 +30,34 @@ class ERPNextClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
 
-    def get_job_applicant(self, email: str) -> Optional[dict]:
-        """Check if a Job Applicant with this email already exists."""
+    def find_job_applicant_by_email(self, email: str) -> Optional[dict]:
+        """
+        Find an existing Job Applicant by email_id filter.
+
+        ERPNext Job Applicant uses auto-generated naming series (e.g., HR-APP-2026-00042),
+        NOT the email address as the document name. We must filter by email_id field.
+
+        Returns:
+            The first matching document dict, or None if not found.
+        """
         resp = self.session.get(
-            self._url(f"/api/resource/Job Applicant/{email}"),
+            self._url("/api/resource/Job Applicant"),
+            params={
+                "filters": f'[["email_id","=","{email}"]]',
+                "fields": '["name","email_id","applicant_name","custom_enrichment_status"]',
+                "limit_page_length": 1,
+            },
+        )
+        if resp.status_code == 200:
+            data = resp.json().get("data", [])
+            if data:
+                return data[0]
+        return None
+
+    def get_job_applicant(self, name: str) -> Optional[dict]:
+        """Fetch a Job Applicant by its auto-generated name (e.g., HR-APP-2026-00042)."""
+        resp = self.session.get(
+            self._url(f"/api/resource/Job Applicant/{quote(name, safe='')}"),
         )
         if resp.status_code == 200:
             return resp.json().get("data")
@@ -36,7 +68,7 @@ class ERPNextClient:
         if not designation:
             return
         resp = self.session.get(
-            self._url(f"/api/resource/Designation/{designation}"),
+            self._url(f"/api/resource/Designation/{quote(designation, safe='')}"),
         )
         if resp.status_code == 404:
             self.session.post(
@@ -49,11 +81,8 @@ class ERPNextClient:
         """
         Create a new Job Applicant record.
 
-        Args:
-            data: Dictionary with Job Applicant fields.
-
         Returns:
-            Created document data.
+            Created document data including the auto-generated 'name' field.
 
         Raises:
             requests.HTTPError on failure.
@@ -66,7 +95,7 @@ class ERPNextClient:
             logger.error(f"Create failed ({resp.status_code}): {resp.text[:500]}")
         resp.raise_for_status()
         result = resp.json().get("data", {})
-        logger.info(f"Created Job Applicant: {result.get('name')}")
+        logger.info(f"Created Job Applicant: {result.get('name')} (email: {data.get('email_id')})")
         return result
 
     def update_job_applicant(self, name: str, data: dict[str, Any]) -> dict:
@@ -74,14 +103,14 @@ class ERPNextClient:
         Update an existing Job Applicant record.
 
         Args:
-            name: The document name (typically email address).
+            name: The auto-generated document name (e.g., HR-APP-2026-00042).
             data: Dictionary with fields to update.
 
         Returns:
             Updated document data.
         """
         resp = self.session.put(
-            self._url(f"/api/resource/Job Applicant/{name}"),
+            self._url(f"/api/resource/Job Applicant/{quote(name, safe='')}"),
             json=data,
         )
         if resp.status_code >= 400:
@@ -102,17 +131,20 @@ class ERPNextClient:
         """
         Upload a file and attach it to a document.
 
+        SECURITY: is_private defaults to True because resumes contain PII.
+        Never upload candidate documents as public files.
+
         Args:
             file_content: Raw file bytes.
             filename: Original filename.
             doctype: Target DocType.
-            docname: Target document name.
-            is_private: Whether file is private.
+            docname: Target document name (auto-generated, e.g., HR-APP-2026-00042).
+            is_private: Whether file is private (MUST be True for PII).
 
         Returns:
             File document data.
         """
-        # Remove Content-Type for multipart
+        # Remove Content-Type for multipart upload
         headers = dict(self.session.headers)
         headers.pop("Content-Type", None)
 
@@ -126,9 +158,11 @@ class ERPNextClient:
                 "is_private": "1" if is_private else "0",
             },
         )
+        if resp.status_code >= 400:
+            logger.error(f"File upload failed ({resp.status_code}): {resp.text[:300]}")
         resp.raise_for_status()
         result = resp.json().get("message", {})
-        logger.info(f"Uploaded file '{filename}' → {result.get('file_url')}")
+        logger.info(f"Uploaded file '{filename}' → {result.get('file_url')} (private={is_private})")
         return result
 
     def create_communication(
@@ -149,7 +183,7 @@ class ERPNextClient:
             subject: Email subject.
             content: Email body (HTML or text).
             reference_doctype: Linked DocType.
-            reference_name: Linked document name.
+            reference_name: The auto-generated document name (NOT the email address).
 
         Returns:
             Created Communication data.
@@ -169,9 +203,11 @@ class ERPNextClient:
             self._url("/api/resource/Communication"),
             json=data,
         )
+        if resp.status_code >= 400:
+            logger.error(f"Communication create failed ({resp.status_code}): {resp.text[:300]}")
         resp.raise_for_status()
         result = resp.json().get("data", {})
-        logger.info(f"Created Communication: {result.get('name')}")
+        logger.info(f"Created Communication: {result.get('name')} → {reference_name}")
         return result
 
     @staticmethod
@@ -183,18 +219,25 @@ class ERPNextClient:
             cleaned.append(cleaned_row)
         return cleaned
 
-    def upsert_job_applicant(self, enriched_data: dict[str, Any], source: str = "Email Inbound") -> dict:
+    def upsert_job_applicant(
+        self,
+        enriched_data: dict[str, Any],
+        source: str = "Email Inbound",
+        message_id: str | None = None,
+    ) -> dict:
         """
         Create or update a Job Applicant with full enrichment data.
 
-        This is the main entry point for the enrichment pipeline.
+        Deduplication: checks by email_id filter (not by name lookup).
+        Returns the document with its auto-generated 'name' for downstream use.
 
         Args:
             enriched_data: Output from baml_runner.extract_resume().
             source: The custom_source value.
+            message_id: RFC 2822 Message-ID for idempotency tracking.
 
         Returns:
-            The created or updated Job Applicant data.
+            The created or updated Job Applicant data (includes 'name' field).
         """
         import json as _json
 
@@ -209,7 +252,10 @@ class ERPNextClient:
 
         # Build enrichment extras as proper JSON
         summary = enriched_data.get("summary") or ""
-        extras = _json.dumps({"summary": summary}, ensure_ascii=False)
+        extras_dict = {"summary": summary}
+        if message_id:
+            extras_dict["message_id"] = message_id
+        extras = _json.dumps(extras_dict, ensure_ascii=False)
 
         # Build the payload
         payload = {
@@ -237,9 +283,11 @@ class ERPNextClient:
         if enriched_data.get("education"):
             payload["custom_education"] = self._clean_child_table(enriched_data["education"])
 
-        # Check for existing record
-        existing = self.get_job_applicant(email)
+        # Dedup: find existing record by email_id filter
+        existing = self.find_job_applicant_by_email(email)
         if existing:
-            return self.update_job_applicant(email, payload)
+            doc_name = existing["name"]
+            logger.info(f"Found existing Job Applicant {doc_name} for {email} — updating")
+            return self.update_job_applicant(doc_name, payload)
         else:
             return self.create_job_applicant(payload)
