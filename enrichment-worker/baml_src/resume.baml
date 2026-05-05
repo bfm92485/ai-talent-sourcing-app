@@ -59,7 +59,7 @@ function ExtractResume(resume_text: string) -> ParsedResume {
 
 // Lighter extraction for LinkedIn/API profiles (less text, more structured)
 function ExtractProfile(profile_text: string) -> ParsedResume {
-  client GPT4Nano
+  client GeminiFlashLite
   prompt #"
     Extract structured candidate data from this profile information.
     This may come from LinkedIn, GitHub, or another platform.

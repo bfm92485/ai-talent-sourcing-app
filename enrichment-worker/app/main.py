@@ -1,12 +1,11 @@
 """
 Enrichment Worker — FastAPI application for processing inbound email webhooks.
 
-Architecture (corrected per council review 2026-05-01):
-- Primitive (primitive.dev) is a MANAGED SaaS — no VPS/Postfix needed
-- Webhook handler returns 200 immediately, processes async in background
-- Idempotency via message_id dedup (Primitive retries up to 6 times)
-- reference_name uses auto-generated ERPNext name, NOT email address
-- Attachments delivered as tar.gz archive via attachments_download_url
+Architecture (self-hosted PrimitiveMail on Hetzner VPS):
+- PrimitiveMail runs on same VPS: milter + watcher + this worker
+- Watcher fires webhook to http://localhost:8090/webhook/inbound-email
+- Attachments served by watcher at http://localhost:4001/download/...
+- Worker extracts resume, runs BAML, pushes to ERPNext (Railway)
 """
 
 import asyncio
@@ -28,7 +27,7 @@ from .enrichment.baml_runner import extract_resume
 from .erpnext.client import ERPNextClient
 from .extractors.docx import extract_text_from_docx
 from .extractors.pdf import extract_text_from_pdf
-from .models.webhook import PrimitiveWebhookPayload
+from .models.webhook import PrimitiveWebhookPayload, parse_webhook_payload
 from .security import get_verified_body
 
 # Configure logging
@@ -39,16 +38,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # In-memory dedup cache (LRU, max 10000 entries)
-# In production, replace with Redis or a persistent store
 _processed_events: OrderedDict[str, bool] = OrderedDict()
 _DEDUP_MAX_SIZE = 10000
 
 
 def _is_duplicate(event_id: str) -> bool:
     """Check if this event has already been processed (idempotency guard)."""
-    if event_id in _processed_events:
-        return True
-    return False
+    return event_id in _processed_events
 
 
 def _mark_processed(event_id: str) -> None:
@@ -76,29 +72,29 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AI Talent Sourcing Enrichment Worker",
     description=(
-        "Processes inbound email webhooks from Primitive (managed SaaS) "
+        "Processes inbound email webhooks from PrimitiveMail (self-hosted) "
         "and creates enriched Job Applicants in ERPNext."
     ),
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for Railway and monitoring."""
-    return {"status": "healthy", "service": "enrichment-worker", "version": "2.0.0"}
+    """Health check endpoint."""
+    return {"status": "healthy", "service": "enrichment-worker", "version": "2.1.0"}
 
 
 @app.post("/webhook/inbound-email")
 async def handle_inbound_email(request: Request, background_tasks: BackgroundTasks):
     """
-    Process an inbound email webhook from Primitive (managed SaaS).
+    Process an inbound email webhook from PrimitiveMail watcher.
 
-    Returns 200 immediately to acknowledge receipt (prevents Primitive retries),
-    then processes the email asynchronously in the background.
+    Returns 200 immediately to acknowledge receipt, then processes
+    the email asynchronously in the background.
 
-    Idempotency: Uses event_id / Message-ID as dedup key.
+    Idempotency: Uses event id as dedup key.
     """
     settings: Settings = request.app.state.settings
     erpnext: ERPNextClient = request.app.state.erpnext
@@ -107,14 +103,15 @@ async def handle_inbound_email(request: Request, background_tasks: BackgroundTas
     body = await get_verified_body(request, settings.webhook_secret)
     logger.info("Webhook signature verified")
 
-    # Step 2: Parse payload
+    # Step 2: Parse payload (SDK envelope or legacy flat format)
     try:
-        payload = PrimitiveWebhookPayload.model_validate_json(body)
+        payload = parse_webhook_payload(body)
     except Exception as e:
+        logger.error(f"Payload parse error: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
 
     # Step 3: Idempotency check
-    event_id = payload.event_id or payload.message_id or ""
+    event_id = payload.event_id
     if not event_id:
         # Generate a deterministic ID from sender + subject + timestamp
         raw = f"{payload.sender_email}:{payload.subject}:{payload.received_at}"
@@ -151,25 +148,29 @@ async def handle_inbound_email(request: Request, background_tasks: BackgroundTas
 
 
 async def _process_email(
-    payload: "PrimitiveWebhookPayload",
+    payload: PrimitiveWebhookPayload,
     settings: Settings,
     erpnext: ERPNextClient,
     event_id: str,
 ) -> None:
     """
     Background task: download attachment, extract text, run BAML, push to ERPNext.
-
-    This runs after the webhook has already returned 200.
     """
     try:
         resume_text = None
         resume_bytes = None
         resume_filename = None
 
-        # Download attachments from Primitive's tar.gz archive
-        if payload.attachments_download_url:
+        # Download attachments from PrimitiveMail's tar.gz archive
+        download_url = payload.attachments_download_url
+        if download_url:
+            # Rewrite localhost URLs to Docker service name (same network)
+            download_url = download_url.replace(
+                "http://localhost:4001", "http://primitivemail-watcher:4001"
+            )
+            logger.info(f"Downloading attachments from: {download_url}")
             resume_bytes, resume_filename = await _download_resume_from_archive(
-                payload.attachments_download_url,
+                download_url,
                 payload.attachments,
                 settings.max_attachment_size,
             )
@@ -209,14 +210,14 @@ async def _process_email(
         if not enriched_data.get("email_id"):
             enriched_data["email_id"] = payload.sender_email
 
-        # Create/update Job Applicant (returns doc with auto-generated 'name')
+        # Create/update Job Applicant
         job_applicant = erpnext.upsert_job_applicant(
             enriched_data,
-            source="Email Inbound",
+            source="Resume Upload",
             message_id=payload.message_id,
         )
 
-        # CRITICAL: Use the auto-generated name for all downstream references
+        # Use the name returned by ERPNext for all downstream references
         doc_name = job_applicant.get("name")
         if not doc_name:
             logger.error("ERPNext did not return a 'name' field — cannot attach files")
@@ -229,7 +230,7 @@ async def _process_email(
                     file_content=resume_bytes,
                     filename=resume_filename,
                     doctype="Job Applicant",
-                    docname=doc_name,  # Auto-generated name, NOT email
+                    docname=doc_name,
                     is_private=True,
                 )
             except Exception as e:
@@ -243,12 +244,12 @@ async def _process_email(
                 subject=payload.subject or "(No Subject)",
                 content=payload.body_html or payload.body_text or "",
                 reference_doctype="Job Applicant",
-                reference_name=doc_name,  # Auto-generated name, NOT email
+                reference_name=doc_name,
             )
         except Exception as e:
             logger.error(f"Communication creation failed (non-fatal): {e}")
 
-        logger.info(f"Successfully processed email → Job Applicant: {doc_name}")
+        logger.info(f"Successfully processed email -> Job Applicant: {doc_name}")
 
     except Exception as e:
         logger.error(f"Background processing failed for event {event_id}: {e}", exc_info=True)
@@ -260,19 +261,15 @@ async def _download_resume_from_archive(
     max_size: int,
 ) -> tuple[Optional[bytes], Optional[str]]:
     """
-    Download attachments from Primitive's tar.gz archive and extract the first resume.
+    Download attachments from PrimitiveMail's tar.gz archive.
 
-    Primitive delivers attachments as a tar.gz archive at `attachments_download_url`.
-    Each attachment has a `tar_path` field mapping to its location within the archive.
-
-    Returns:
-        Tuple of (file_bytes, filename) or (None, None) if no resume found.
+    PrimitiveMail watcher serves the archive at http://localhost:4001/download/...
+    with a 15-minute expiry token.
     """
-    # Find resume-like attachments
     resume_extensions = {".pdf", ".docx", ".doc"}
     resume_att = None
     for att in attachments:
-        filename = att.get("filename", "") if isinstance(att, dict) else getattr(att, "filename", "")
+        filename = att.filename if hasattr(att, "filename") else att.get("filename", "")
         if any(filename.lower().endswith(ext) for ext in resume_extensions):
             resume_att = att
             break
@@ -280,8 +277,8 @@ async def _download_resume_from_archive(
     if not resume_att:
         return None, None
 
-    tar_path = resume_att.get("tar_path", "") if isinstance(resume_att, dict) else getattr(resume_att, "tar_path", "")
-    filename = resume_att.get("filename", "") if isinstance(resume_att, dict) else getattr(resume_att, "filename", "")
+    tar_path = resume_att.tar_path if hasattr(resume_att, "tar_path") else resume_att.get("tar_path", "")
+    filename = resume_att.filename if hasattr(resume_att, "filename") else resume_att.get("filename", "")
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -297,7 +294,6 @@ async def _download_resume_from_archive(
 
         # Extract the specific file from the tar.gz archive
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-            # Try tar_path first, then filename
             member = None
             for name_to_try in [tar_path, filename]:
                 if name_to_try:
@@ -334,6 +330,9 @@ async def handle_test_webhook(request: Request):
     Only for development/testing — disable in production via DISABLE_TEST_ENDPOINT env var.
     """
     settings: Settings = request.app.state.settings
+    if settings.disable_test_endpoint:
+        raise HTTPException(status_code=404, detail="Not found")
+
     erpnext: ERPNextClient = request.app.state.erpnext
 
     body = await request.body()

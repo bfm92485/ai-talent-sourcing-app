@@ -1,41 +1,31 @@
 // AI Talent Sourcing - BAML Client Configuration
-// Uses Gemini Flash via OpenAI-compatible endpoint (pre-configured in env)
+// Uses Gemini Flash directly via Google's OpenAI-compatible endpoint
 
 client<llm> GeminiFlash {
   provider openai-generic
   retry_policy Exponential
   options {
     model "gemini-2.5-flash"
-    api_key env.OPENAI_API_KEY
-    base_url env.OPENAI_BASE_URL
+    api_key env.GEMINI_API_KEY
+    base_url "https://generativelanguage.googleapis.com/v1beta/openai"
   }
 }
 
-client<llm> GPT4Mini {
+client<llm> GeminiFlashLite {
   provider openai-generic
   retry_policy Exponential
   options {
-    model "gpt-4.1-mini"
-    api_key env.OPENAI_API_KEY
-    base_url env.OPENAI_BASE_URL
+    model "gemini-2.0-flash-lite"
+    api_key env.GEMINI_API_KEY
+    base_url "https://generativelanguage.googleapis.com/v1beta/openai"
   }
 }
 
-client<llm> GPT4Nano {
-  provider openai-generic
-  retry_policy Constant
-  options {
-    model "gpt-4.1-nano"
-    api_key env.OPENAI_API_KEY
-    base_url env.OPENAI_BASE_URL
-  }
-}
-
-// Fallback strategy: try fast model first, then more capable
+// Fallback strategy: try fast model first, then lite
 client<llm> ResumeParser {
   provider fallback
   options {
-    strategy [GeminiFlash, GPT4Mini]
+    strategy [GeminiFlash, GeminiFlashLite]
   }
 }
 
