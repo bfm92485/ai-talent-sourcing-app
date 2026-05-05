@@ -1,23 +1,21 @@
 // AI Talent Sourcing - BAML Client Configuration
-// Uses Gemini Flash directly via Google's OpenAI-compatible endpoint
+// Uses Gemini Flash directly via native google-ai provider
 
 client<llm> GeminiFlash {
-  provider openai-generic
+  provider google-ai
   retry_policy Exponential
   options {
     model "gemini-2.5-flash"
     api_key env.GEMINI_API_KEY
-    base_url "https://generativelanguage.googleapis.com/v1beta/openai"
   }
 }
 
 client<llm> GeminiFlashLite {
-  provider openai-generic
+  provider google-ai
   retry_policy Exponential
   options {
     model "gemini-2.0-flash-lite"
     api_key env.GEMINI_API_KEY
-    base_url "https://generativelanguage.googleapis.com/v1beta/openai"
   }
 }
 
