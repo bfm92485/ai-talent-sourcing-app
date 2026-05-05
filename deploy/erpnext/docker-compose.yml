@@ -1,0 +1,210 @@
+# ERPNext v16 Production Deployment - Hetzner VPS (CX32)
+# Based on: https://github.com/frappe/frappe_docker
+# Tuned for: 4 GB RAM shared with PrimitiveMail + Enrichment Worker
+#
+# Usage:
+#   cp example.env .env  # then edit values
+#   docker compose up -d
+#   docker compose exec backend bench new-site erp.talent.amdg.ai \
+#     --mariadb-root-password ${DB_PASSWORD} --admin-password ${ADMIN_PASSWORD}
+#   docker compose exec backend bench --site erp.talent.amdg.ai install-app erpnext
+#   docker compose exec backend bench --site erp.talent.amdg.ai install-app hrms
+#
+# Restore from Railway:
+#   docker compose exec backend bench --site erp.talent.amdg.ai \
+#     restore /home/frappe/frappe-bench/sites/backup.sql.gz \
+#     --mariadb-root-password ${DB_PASSWORD} --with-private-files /path/to/private.tar
+
+x-customizable-image: &customizable_image
+  image: frappe/erpnext:${ERPNEXT_VERSION:-v16.15.1}
+  pull_policy: always
+  restart: unless-stopped
+
+x-depends-on-configurator: &depends_on_configurator
+  depends_on:
+    configurator:
+      condition: service_completed_successfully
+
+x-backend-defaults: &backend_defaults
+  <<: [*depends_on_configurator, *customizable_image]
+  platform: linux/amd64
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+
+services:
+  # === ONE-TIME CONFIGURATOR ===
+  configurator:
+    <<: *backend_defaults
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host db;
+        bench set-config -gp db_port 3306;
+        bench set-config -g redis_cache "redis://redis-cache:6379";
+        bench set-config -g redis_queue "redis://redis-queue:6379";
+        bench set-config -g redis_socketio "redis://redis-queue:6379";
+        bench set-config -gp socketio_port 9000;
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
+    restart: on-failure
+
+  # === WEB BACKEND (gunicorn) ===
+  backend:
+    <<: *backend_defaults
+    environment:
+      # Cap workers to 2 on CX32 (4 GB). Default would be 5 (2*cores+1) = OOM risk.
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # === NGINX FRONTEND ===
+  frontend:
+    <<: *customizable_image
+    platform: linux/amd64
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-$$host}
+      UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
+      UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
+      UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
+      PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
+      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      - backend
+      - websocket
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # === WEBSOCKET (node) ===
+  websocket:
+    <<: [*depends_on_configurator, *customizable_image]
+    platform: linux/amd64
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # === BACKGROUND WORKERS ===
+  # Single combined worker for short + long queues (RAM-optimized)
+  queue-worker:
+    <<: *backend_defaults
+    command: bench worker --queue short,long,default
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+        reservations:
+          memory: 128M
+
+  # === SCHEDULER ===
+  scheduler:
+    <<: *backend_defaults
+    command: bench schedule
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+  # === DATABASE ===
+  db:
+    image: mariadb:10.6
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 10s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      # RAM caps - critical for shared VPS
+      - --innodb-buffer-pool-size=256M
+      - --innodb-log-file-size=64M
+      - --key-buffer-size=32M
+      - --max-connections=50
+      - --table-open-cache=400
+      - --thread-cache-size=4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD not set}
+      MARIADB_AUTO_UPGRADE: 1
+    volumes:
+      - db-data:/var/lib/mysql
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # === REDIS ===
+  redis-cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 96M
+
+  redis-queue:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-queue-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 96M
+
+  # === REVERSE PROXY (Caddy) ===
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - frontend
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+volumes:
+  sites:
+  db-data:
+  redis-queue-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  default:
+    name: primitivemail_default
+    external: true

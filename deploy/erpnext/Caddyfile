@@ -1,0 +1,30 @@
+# Caddyfile for ERPNext on Hetzner VPS
+# Auto-TLS via Let's Encrypt
+# Proxies to the ERPNext frontend (nginx) container
+
+{
+	email {$LETSENCRYPT_EMAIL:bryan@amdg.ai}
+}
+
+erp.talent.amdg.ai {
+	# Proxy all traffic to the ERPNext frontend (nginx)
+	reverse_proxy frontend:8080
+
+	# Security headers
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options SAMEORIGIN
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+
+	# Increase timeouts for long-running requests (reports, imports)
+	reverse_proxy frontend:8080 {
+		transport http {
+			read_timeout 120s
+			write_timeout 120s
+		}
+	}
+
+	# Compress responses
+	encode gzip zstd
+}
