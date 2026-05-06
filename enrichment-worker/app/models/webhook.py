@@ -28,9 +28,9 @@ The PrimitiveMail SDK wraps email data in an EmailReceivedEvent envelope:
 
 import json
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -81,10 +81,19 @@ class ParsedContent(BaseModel):
     reply_to: Optional[str] = None
     cc: Optional[str] = None
     bcc: Optional[str] = None
-    in_reply_to: Optional[str] = None
-    references: Optional[str] = None
+    in_reply_to: Optional[Union[str, list]] = None
+    references: Optional[Union[str, list]] = None
+
     attachments: list[PrimitiveAttachment] = Field(default_factory=list)
     attachments_download_url: Optional[str] = None
+
+    @field_validator("in_reply_to", "references", mode="before")
+    @classmethod
+    def coerce_to_string(cls, v):
+        """Coerce list values to comma-separated string."""
+        if isinstance(v, list):
+            return ", ".join(str(item) for item in v)
+        return v
 
 
 class AuthResults(BaseModel):
