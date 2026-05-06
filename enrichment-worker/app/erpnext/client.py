@@ -277,6 +277,10 @@ class ERPNextClient:
         if enriched_data.get("phone_number"):
             payload["phone_number"] = enriched_data["phone_number"]
 
+        # Add referral source if available (from forwarded email detection)
+        if enriched_data.get("referred_by"):
+            payload["custom_referred_by"] = enriched_data["referred_by"]
+
         # Add child tables (clean None values)
         if enriched_data.get("experience"):
             payload["custom_experience"] = self._clean_child_table(enriched_data["experience"])
