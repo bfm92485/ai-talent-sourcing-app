@@ -50,6 +50,9 @@ CUSTOM_FIELDS = [
         "options": "\nResume Upload\nAPI Search\nWeb Portal\nLinkedIn\nGitHub\nReferral",
         "description": "How this candidate was sourced"
     }),
+    ("custom_referred_by", "Data", "Referred By", "custom_source", {
+        "description": "Identity of the recruiter or person who referred this candidate (extracted from forwarded email)"
+    }),
     # After country, insert column for Status/Rating (handled by core fields)
     # After status section, LinkedIn/GitHub/Company column
     ("custom_col_identity_2", "Column Break", "", "country", {}),
