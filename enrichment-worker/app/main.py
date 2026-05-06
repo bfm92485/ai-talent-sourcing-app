@@ -208,6 +208,53 @@ def _should_skip_sender_as_applicant(
     return True
 
 
+def _extract_source_from_forwarded_email(
+    subject: Optional[str],
+    body_text: Optional[str],
+    sender_name: str,
+    sender_email: str,
+) -> Optional[str]:
+    """
+    Extract the referral source identity from a forwarded email.
+
+    For forwarded emails, the "source" is the original sender (typically a recruiter)
+    whose email was forwarded. This function extracts that identity as a formatted string.
+
+    Logic:
+    1. If the email is NOT forwarded → return None (use default source)
+    2. If forwarded and the body contains a From: line after a forward marker
+       → return "Name <email>" or just "email" if no name
+    3. If forwarded but no From: line is parseable
+       → return "SenderName <sender_email>" (the forwarder is the referral source)
+
+    Args:
+        subject: Email subject line.
+        body_text: Plain text body of the email.
+        sender_name: Display name of the email sender (the forwarder).
+        sender_email: Email address of the sender (the forwarder).
+
+    Returns:
+        Referral source string, or None if the email is not forwarded.
+    """
+    if not _is_forwarded_email(subject=subject, body_text=body_text):
+        return None
+
+    # Try to extract the original sender from the forwarded body
+    original_sender = _extract_candidate_from_forwarded_body(body_text or "")
+    if original_sender:
+        name = original_sender.get("name", "")
+        email = original_sender.get("email", "")
+        if name and email:
+            return f"{name} <{email}>"
+        elif email:
+            return email
+
+    # Fallback: the forwarder themselves are the referral source
+    if sender_name:
+        return f"{sender_name} <{sender_email}>"
+    return sender_email
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — initialize shared resources."""
@@ -351,6 +398,15 @@ async def _process_email(
         )
 
         if resume_files:
+            # Determine the source for this email (recruiter referral or direct)
+            referred_by = _extract_source_from_forwarded_email(
+                subject=payload.subject,
+                body_text=payload.body_text,
+                sender_name=payload.sender_name,
+                sender_email=payload.sender_email,
+            )
+            source = "Referral" if referred_by else "Resume Upload"
+
             # Process each resume as a separate Job Applicant
             for filename, file_bytes in resume_files.items():
                 await _process_single_resume(
@@ -360,6 +416,8 @@ async def _process_email(
                     erpnext=erpnext,
                     event_id=event_id,
                     cover_letters=cover_letter_files,
+                    source=source,
+                    referred_by=referred_by,
                 )
         else:
             # No resume attachments — check if this is a forwarded email
@@ -402,8 +460,21 @@ async def _process_single_resume(
     erpnext: ERPNextClient,
     event_id: str,
     cover_letters: dict[str, bytes],
+    source: str = "Resume Upload",
+    referred_by: Optional[str] = None,
 ) -> None:
-    """Process a single resume attachment → one Job Applicant."""
+    """Process a single resume attachment → one Job Applicant.
+
+    Args:
+        filename: Resume filename.
+        file_bytes: Raw file content.
+        payload: Original webhook payload.
+        erpnext: ERPNext API client.
+        event_id: Idempotency event ID.
+        cover_letters: Dict of cover letter filename → bytes.
+        source: The custom_source value (e.g., 'Resume Upload' or 'Referral').
+        referred_by: If source is 'Referral', the identity of the referrer.
+    """
     logger.info(f"Processing resume: {filename} ({len(file_bytes)} bytes)")
 
     # Extract text from the resume file
@@ -444,10 +515,14 @@ async def _process_single_resume(
             f"using placeholder: {candidate_email}"
         )
 
+    # Add referral source to enriched_data if this is a forwarded/referred candidate
+    if referred_by:
+        enriched_data["referred_by"] = referred_by
+
     # Create/update Job Applicant
     job_applicant = erpnext.upsert_job_applicant(
         enriched_data,
-        source="Resume Upload",
+        source=source,
         message_id=payload.message_id,
     )
 
