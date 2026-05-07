@@ -7,3 +7,4 @@ python-docx>=1.1.0
 baml-py>=0.70.0
 requests>=2.31.0
 python-dotenv>=1.0.0
+mail-parser-reply>=0.2.0

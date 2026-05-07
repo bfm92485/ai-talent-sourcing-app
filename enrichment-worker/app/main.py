@@ -12,8 +12,10 @@ Multi-resume handling:
 - Each resume attachment is processed independently → one Job Applicant per resume
 - Cover letters are associated with the nearest preceding/following resume by candidate name
 
-Forwarded email handling:
-- Emails with FW:/Fwd: subjects or forwarded-message markers in the body are detected
+Forwarded email handling (deterministic parser):
+- Uses mail-parser-reply for robust, multi-language forward detection
+- Extracts original sender (recruiter) metadata with confidence scoring
+- When confidence < 0.5, flags for optional LLM fallback
 - When a forwarded email has resume attachments, each resume is processed normally
   (the candidate identity comes from the resume, not the sender)
 - When a forwarded email has NO resume attachments, the body-text fallback is SKIPPED
@@ -36,6 +38,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from .config import Settings, get_settings
+from .email_parser import ForwardedEmailMetadata, parse_forwarded_email
 from .enrichment.baml_runner import extract_resume
 from .erpnext.client import ERPNextClient
 from .extractors.docx import extract_text_from_docx
@@ -59,25 +62,6 @@ RESUME_EXTENSIONS = {".pdf", ".docx", ".doc"}
 
 # Keywords that indicate a cover letter (not a resume)
 COVER_LETTER_KEYWORDS = {"cover_letter", "cover letter", "coverletter", "cover-letter"}
-
-# Patterns that indicate a forwarded email
-_FORWARD_SUBJECT_PATTERN = re.compile(r"^\s*(fw|fwd)\s*:", re.IGNORECASE)
-_FORWARD_BODY_MARKERS = [
-    "---------- Forwarded message",
-    "-----Original Message-----",
-    "-------- Original Message --------",
-    "Begin forwarded message:",
-]
-
-# Regex to extract "Name <email>" from a From: line in forwarded body
-_FROM_LINE_PATTERN = re.compile(
-    r"^From:\s*(.+?)\s*<([^>]+)>",
-    re.MULTILINE,
-)
-_FROM_LINE_EMAIL_ONLY = re.compile(
-    r"^From:\s*<?([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})>?",
-    re.MULTILINE,
-)
 
 
 def _is_duplicate(event_id: str) -> bool:
@@ -105,156 +89,6 @@ def _is_resume_file(filename: str) -> bool:
     return has_resume_ext and not _is_cover_letter(lower)
 
 
-def _is_forwarded_email(
-    subject: Optional[str] = None,
-    body_text: Optional[str] = None,
-) -> bool:
-    """
-    Detect whether an email is a forward based on subject and/or body content.
-
-    Checks:
-    1. Subject starts with FW:, Fwd:, or RE: FW: (case-insensitive)
-    2. Body contains forwarded message markers (Gmail, Outlook, Apple Mail)
-
-    Returns:
-        True if the email appears to be forwarded.
-    """
-    # Check subject line
-    if subject:
-        # Strip any leading RE: prefixes first, then check for FW/Fwd
-        cleaned_subject = re.sub(r"^\s*(re\s*:\s*)+", "", subject, flags=re.IGNORECASE)
-        if _FORWARD_SUBJECT_PATTERN.match(cleaned_subject):
-            return True
-        # Also check the original subject directly
-        if _FORWARD_SUBJECT_PATTERN.match(subject):
-            return True
-
-    # Check body for forwarded message markers
-    if body_text:
-        for marker in _FORWARD_BODY_MARKERS:
-            if marker in body_text:
-                return True
-
-    return False
-
-
-def _extract_candidate_from_forwarded_body(body_text: str) -> Optional[dict]:
-    """
-    Attempt to extract the original sender (candidate) from a forwarded email body.
-
-    Looks for a 'From:' line after a forwarded-message marker and extracts
-    the name and email address.
-
-    Returns:
-        Dict with 'name' and 'email' keys, or None if extraction fails.
-    """
-    if not body_text:
-        return None
-
-    # Find the position of the first forwarded-message marker
-    marker_pos = -1
-    for marker in _FORWARD_BODY_MARKERS:
-        pos = body_text.find(marker)
-        if pos >= 0 and (marker_pos < 0 or pos < marker_pos):
-            marker_pos = pos
-
-    # Only look for From: lines AFTER the forwarded message marker
-    search_text = body_text[marker_pos:] if marker_pos >= 0 else body_text
-
-    # Try to match "From: Name <email>"
-    match = _FROM_LINE_PATTERN.search(search_text)
-    if match:
-        name = match.group(1).strip().strip('"')
-        email = match.group(2).strip()
-        return {"name": name, "email": email}
-
-    # Try to match "From: email@domain.com" (without angle brackets)
-    match = _FROM_LINE_EMAIL_ONLY.search(search_text)
-    if match:
-        email = match.group(1).strip()
-        # Derive name from email local part
-        local = email.split("@")[0]
-        name = local.replace(".", " ").replace("_", " ").title()
-        return {"name": name, "email": email}
-
-    return None
-
-
-def _should_skip_sender_as_applicant(
-    is_forwarded: bool,
-    has_resume_attachments: bool,
-    sender_email: str,
-) -> bool:
-    """
-    Determine whether to skip creating a Job Applicant for the email sender.
-
-    When an email is forwarded, the sender is typically a recruiter or internal
-    user — NOT the actual candidate. In this case, we should NOT create a
-    Job Applicant record for the sender.
-
-    The actual candidate identity comes from:
-    - Resume attachments (processed by _process_single_resume, which extracts
-      the candidate name/email from the resume content via BAML)
-    - The forwarded email body (From: line after the forward marker)
-
-    Returns:
-        True if the sender should NOT be used as the applicant.
-    """
-    if not is_forwarded:
-        return False
-
-    # Forwarded emails: always skip the sender as applicant
-    # The candidate identity should come from the resume content or forwarded body
-    return True
-
-
-def _extract_source_from_forwarded_email(
-    subject: Optional[str],
-    body_text: Optional[str],
-    sender_name: str,
-    sender_email: str,
-) -> Optional[str]:
-    """
-    Extract the referral source identity from a forwarded email.
-
-    For forwarded emails, the "source" is the original sender (typically a recruiter)
-    whose email was forwarded. This function extracts that identity as a formatted string.
-
-    Logic:
-    1. If the email is NOT forwarded → return None (use default source)
-    2. If forwarded and the body contains a From: line after a forward marker
-       → return "Name <email>" or just "email" if no name
-    3. If forwarded but no From: line is parseable
-       → return "SenderName <sender_email>" (the forwarder is the referral source)
-
-    Args:
-        subject: Email subject line.
-        body_text: Plain text body of the email.
-        sender_name: Display name of the email sender (the forwarder).
-        sender_email: Email address of the sender (the forwarder).
-
-    Returns:
-        Referral source string, or None if the email is not forwarded.
-    """
-    if not _is_forwarded_email(subject=subject, body_text=body_text):
-        return None
-
-    # Try to extract the original sender from the forwarded body
-    original_sender = _extract_candidate_from_forwarded_body(body_text or "")
-    if original_sender:
-        name = original_sender.get("name", "")
-        email = original_sender.get("email", "")
-        if name and email:
-            return f"{name} <{email}>"
-        elif email:
-            return email
-
-    # Fallback: the forwarder themselves are the referral source
-    if sender_name:
-        return f"{sender_name} <{sender_email}>"
-    return sender_email
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — initialize shared resources."""
@@ -276,7 +110,7 @@ app = FastAPI(
         "Processes inbound email webhooks from PrimitiveMail (self-hosted) "
         "and creates enriched Job Applicants in ERPNext."
     ),
-    version="2.3.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -284,7 +118,7 @@ app = FastAPI(
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "service": "enrichment-worker", "version": "2.3.0"}
+    return {"status": "healthy", "service": "enrichment-worker", "version": "3.0.0"}
 
 
 @app.post("/webhook/inbound-email")
@@ -292,37 +126,25 @@ async def handle_inbound_email(request: Request, background_tasks: BackgroundTas
     """
     Process an inbound email webhook from PrimitiveMail watcher.
 
-    Returns 200 immediately to acknowledge receipt, then processes
-    the email asynchronously in the background.
-
-    Multi-resume: If the email contains multiple resume attachments,
-    each is processed as a separate Job Applicant.
-
-    Idempotency: Uses event id as dedup key.
+    Returns 200 immediately to acknowledge receipt,
+    then processes the email asynchronously in the background.
     """
     settings: Settings = request.app.state.settings
     erpnext: ERPNextClient = request.app.state.erpnext
 
     # Step 1: Verify HMAC signature
-    body = await get_verified_body(request, settings.webhook_secret)
-    logger.info("Webhook signature verified")
+    raw_body = await get_verified_body(request, settings.webhook_secret)
 
-    # Step 2: Parse payload (SDK envelope or legacy flat format)
-    try:
-        payload = parse_webhook_payload(body)
-    except Exception as e:
-        logger.error(f"Payload parse error: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
+    # Step 2: Parse the webhook payload
+    payload = parse_webhook_payload(raw_body)
 
-    # Step 3: Idempotency check
-    event_id = payload.event_id
-    if not event_id:
-        # Generate a deterministic ID from sender + subject + timestamp
-        raw = f"{payload.sender_email}:{payload.subject}:{payload.received_at}"
-        event_id = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    # Step 3: Idempotency check — compute event_id from message_id
+    event_id = hashlib.sha256(
+        (payload.message_id or "").encode()
+    ).hexdigest()[:16]
 
     if _is_duplicate(event_id):
-        logger.info(f"Duplicate event {event_id} — skipping (idempotency)")
+        logger.info(f"Duplicate event {event_id} — skipping")
         return JSONResponse(
             status_code=200,
             content={"status": "duplicate", "event_id": event_id},
@@ -367,8 +189,31 @@ async def _process_email(
     - Processes each resume independently → one Job Applicant per resume
     - If no resumes found, falls back to email body text
       (but ONLY if the email is not a forward)
+
+    Forwarded email detection:
+    - Uses the deterministic email_parser module (mail-parser-reply based)
+    - Extracts recruiter/source metadata with confidence scoring
+    - If confidence < 0.5, logs a warning (future: LLM fallback)
     """
     try:
+        # Parse forwarded email metadata using the deterministic parser
+        forward_metadata = parse_forwarded_email(
+            body_text=payload.body_text or "",
+            subject=payload.subject,
+        )
+
+        if forward_metadata.is_forwarded:
+            logger.info(
+                f"Forwarded email detected (confidence={forward_metadata.confidence:.2f}): "
+                f"referred_by={forward_metadata.referred_by_display}"
+            )
+            if forward_metadata.needs_llm_fallback:
+                logger.warning(
+                    f"Low confidence parse ({forward_metadata.confidence:.2f}) — "
+                    f"errors: {forward_metadata.parse_errors}. "
+                    f"Consider LLM fallback for event {event_id}"
+                )
+
         # Download the attachments archive
         archive_files = {}  # filename -> bytes
         download_url = payload.attachments_download_url
@@ -398,14 +243,13 @@ async def _process_email(
         )
 
         if resume_files:
-            # Determine the source for this email (recruiter referral or direct)
-            referred_by = _extract_source_from_forwarded_email(
-                subject=payload.subject,
-                body_text=payload.body_text,
-                sender_name=payload.sender_name,
-                sender_email=payload.sender_email,
-            )
-            source = "Referral" if referred_by else "Resume Upload"
+            # Determine source and referral info from the forward metadata
+            if forward_metadata.is_forwarded and forward_metadata.referred_by_display:
+                source = "Referral"
+                referred_by = forward_metadata.referred_by_display
+            else:
+                source = "Resume Upload"
+                referred_by = None
 
             # Process each resume as a separate Job Applicant
             for filename, file_bytes in resume_files.items():
@@ -421,16 +265,7 @@ async def _process_email(
                 )
         else:
             # No resume attachments — check if this is a forwarded email
-            is_forwarded = _is_forwarded_email(
-                subject=payload.subject,
-                body_text=payload.body_text,
-            )
-
-            if _should_skip_sender_as_applicant(
-                is_forwarded=is_forwarded,
-                has_resume_attachments=False,
-                sender_email=payload.sender_email,
-            ):
+            if forward_metadata.is_forwarded:
                 logger.info(
                     f"Forwarded email from {payload.sender_email} with no resume "
                     f"attachments — skipping body-text fallback to avoid creating "
@@ -589,7 +424,11 @@ async def _process_body_text_fallback(
     """
     # Double-check: if this is a forwarded email, do NOT create a record
     # for the sender (defensive guard in case caller logic changes)
-    if _is_forwarded_email(subject=payload.subject, body_text=payload.body_text):
+    forward_check = parse_forwarded_email(
+        body_text=payload.body_text or "",
+        subject=payload.subject,
+    )
+    if forward_check.is_forwarded:
         logger.warning(
             f"_process_body_text_fallback called for forwarded email from "
             f"{payload.sender_email} — skipping to avoid incorrect record"
