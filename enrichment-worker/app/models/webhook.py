@@ -78,21 +78,36 @@ class ParsedContent(BaseModel):
     error: Optional[str] = None
     body_text: Optional[str] = None
     body_html: Optional[str] = None
-    reply_to: Optional[str] = None
-    cc: Optional[str] = None
-    bcc: Optional[str] = None
+    reply_to: Optional[Union[str, list]] = None
+    cc: Optional[Union[str, list]] = None
+    bcc: Optional[Union[str, list]] = None
     in_reply_to: Optional[Union[str, list]] = None
     references: Optional[Union[str, list]] = None
 
     attachments: list[PrimitiveAttachment] = Field(default_factory=list)
     attachments_download_url: Optional[str] = None
 
-    @field_validator("in_reply_to", "references", mode="before")
+    @field_validator("reply_to", "cc", "bcc", "in_reply_to", "references", mode="before")
     @classmethod
     def coerce_to_string(cls, v):
-        """Coerce list values to comma-separated string."""
+        """Coerce list values to comma-separated string.
+
+        PrimitiveMail may send these fields as either a plain string or a list
+        of objects like [{"address": "...", "name": "..."}]. Handle both.
+        """
         if isinstance(v, list):
-            return ", ".join(str(item) for item in v)
+            parts = []
+            for item in v:
+                if isinstance(item, dict):
+                    addr = item.get("address", "")
+                    name = item.get("name", "")
+                    if name:
+                        parts.append(f"{name} <{addr}>")
+                    else:
+                        parts.append(addr)
+                else:
+                    parts.append(str(item))
+            return ", ".join(parts)
         return v
 
 
